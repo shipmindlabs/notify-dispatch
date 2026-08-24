@@ -31,3 +31,7 @@ Issues = "https://github.com/shipmindlabs/notify-dispatch/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/notify_dispatch"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
