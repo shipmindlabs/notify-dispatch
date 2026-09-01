@@ -75,6 +75,34 @@ to pin a single channel. If no candidate has both an address and a registered
 adapter, `send` raises `UnroutableError`; if the provider itself fails, the
 error is wrapped in `DeliveryError` carrying the channel and address.
 
+## Quiet hours
+
+A recipient can carry a do-not-disturb window. Inside it the silenced channels
+are skipped, so routing falls through to a channel that is still allowed. If
+nothing is left, `send` raises `QuietHoursError` rather than waking someone up.
+
+```python
+from datetime import time
+
+from notify_dispatch import Channel, QuietHours, Recipient, Urgency
+
+ada = Recipient(
+    device_token="tok",
+    email="ada@example.com",
+    preferred=(Channel.PUSH,),
+    quiet_hours=QuietHours(time(22, 0), time(7, 0), channels=(Channel.PUSH, Channel.SMS)),
+)
+
+dispatcher.send(ada, confirmation, context)               # 23:30 — email, push is silent
+dispatcher.send(ada, outage, context, urgency=Urgency.URGENT)  # push anyway
+```
+
+Only an explicit `urgency=Urgency.URGENT` overrides the window; the chosen
+urgency travels on to the adapter as `message.urgency`. The window is read
+against the dispatcher's clock — pass `now=` for a fixed moment, or
+`Dispatcher(..., clock=...)` to control it everywhere. A window whose start is
+later than its end (22:00–07:00) wraps past midnight.
+
 ## Development
 
 ```bash

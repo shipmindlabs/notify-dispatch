@@ -8,7 +8,8 @@ the same protocol, so swapping a provider does not touch any call site.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, time
 from enum import Enum
 from typing import Protocol
 
@@ -24,10 +25,13 @@ __all__ = [
     "EmailAdapter",
     "Message",
     "PushAdapter",
+    "QuietHours",
+    "QuietHoursError",
     "Receipt",
     "Recipient",
     "SmsAdapter",
     "UnroutableError",
+    "Urgency",
 ]
 
 
@@ -37,6 +41,13 @@ class Channel(str, Enum):
     SMS = "sms"
     PUSH = "push"
     EMAIL = "email"
+
+
+class Urgency(str, Enum):
+    """How far a message may go to reach someone."""
+
+    NORMAL = "normal"
+    URGENT = "urgent"
 
 
 DEFAULT_CHANNEL_ORDER: tuple[Channel, ...] = (Channel.PUSH, Channel.SMS, Channel.EMAIL)
@@ -56,6 +67,20 @@ class UnroutableError(DispatchError):
         super().__init__(f"template {template!r} has no usable channel; tried {listed}")
 
 
+class QuietHoursError(DispatchError):
+    """Every usable channel is inside the recipient's do-not-disturb window."""
+
+    def __init__(self, template: str, silenced: Iterable[Channel], until: time) -> None:
+        self.template = template
+        self.silenced = tuple(silenced)
+        self.until = until
+        listed = ", ".join(channel.value for channel in self.silenced)
+        super().__init__(
+            f"template {template!r} is silenced on {listed} until "
+            f"{until.isoformat('minutes')}; send with Urgency.URGENT to override"
+        )
+
+
 class DeliveryError(DispatchError):
     """The adapter for the chosen channel failed to hand the message over."""
 
@@ -67,6 +92,35 @@ class DeliveryError(DispatchError):
 
 
 @dataclass(frozen=True)
+class QuietHours:
+    """A wall-clock window during which some channels stay silent.
+
+    A window whose start is later than its end wraps past midnight.
+    """
+
+    start: time
+    end: time
+    channels: tuple[Channel, ...] = tuple(Channel)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "channels", tuple(self.channels))
+        if self.start == self.end:
+            raise ValueError("quiet hours start and end must differ")
+        if not self.channels:
+            raise ValueError("quiet hours must silence at least one channel")
+
+    def covers(self, moment: datetime | time) -> bool:
+        """Return whether a moment falls inside the window."""
+        at = moment.time() if isinstance(moment, datetime) else moment
+        if self.start < self.end:
+            return self.start <= at < self.end
+        return at >= self.start or at < self.end
+
+    def silences(self, channel: Channel, moment: datetime | time) -> bool:
+        return channel in self.channels and self.covers(moment)
+
+
+@dataclass(frozen=True)
 class Recipient:
     """Where a person can be reached, and how they prefer to be reached."""
 
@@ -74,6 +128,7 @@ class Recipient:
     device_token: str | None = None
     email: str | None = None
     preferred: tuple[Channel, ...] = ()
+    quiet_hours: QuietHours | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "preferred", tuple(self.preferred))
@@ -86,6 +141,12 @@ class Recipient:
             Channel.EMAIL: self.email,
         }
         return addresses[channel]
+
+    def is_quiet(self, channel: Channel, moment: datetime | time) -> bool:
+        """Return whether a channel is inside the do-not-disturb window."""
+        if self.quiet_hours is None:
+            return False
+        return self.quiet_hours.silences(channel, moment)
 
     @property
     def reachable_channels(self) -> tuple[Channel, ...]:
@@ -103,6 +164,7 @@ class Message:
     channel: Channel
     address: str
     subject: str | None = None
+    urgency: Urgency = Urgency.NORMAL
 
 
 @dataclass(frozen=True)
@@ -168,9 +230,11 @@ class Dispatcher:
         adapters: Iterable[ChannelAdapter] = (),
         *,
         order: Sequence[Channel] = DEFAULT_CHANNEL_ORDER,
+        clock: Callable[[], datetime] = datetime.now,
     ) -> None:
         self._adapters: dict[Channel, ChannelAdapter] = {}
         self._order = tuple(order)
+        self._clock = clock
         for adapter in adapters:
             self.register(adapter)
 
@@ -190,14 +254,21 @@ class Dispatcher:
         *,
         channel: Channel | None = None,
         subject: str | None = None,
+        urgency: Urgency = Urgency.NORMAL,
+        now: datetime | None = None,
     ) -> Receipt:
         """Render the template and deliver it, or raise before anything is sent."""
         body = template.render(context or {})
+        moment = now if now is not None else self._clock()
         candidates = (channel,) if channel is not None else self._preference(recipient)
+        silenced: list[Channel] = []
         for candidate in candidates:
             address = recipient.address_for(candidate)
             adapter = self._adapters.get(candidate)
             if address is None or adapter is None:
+                continue
+            if urgency is not Urgency.URGENT and recipient.is_quiet(candidate, moment):
+                silenced.append(candidate)
                 continue
             message = Message(
                 template=template.name,
@@ -205,12 +276,16 @@ class Dispatcher:
                 channel=candidate,
                 address=address,
                 subject=subject,
+                urgency=urgency,
             )
             try:
                 reference = adapter.deliver(message)
             except Exception as exc:
                 raise DeliveryError(candidate, address, exc) from exc
             return Receipt(message=message, reference=reference)
+        if silenced:
+            assert recipient.quiet_hours is not None
+            raise QuietHoursError(template.name, silenced, recipient.quiet_hours.end)
         raise UnroutableError(template.name, candidates)
 
     def _preference(self, recipient: Recipient) -> tuple[Channel, ...]:
