@@ -1,5 +1,12 @@
 """Template-driven notifications across SMS, push and email."""
 
+from notify_dispatch.delivery import (
+    NO_RETRY,
+    Attempt,
+    DeadLetter,
+    DeadLetterQueue,
+    RetryPolicy,
+)
 from notify_dispatch.dispatch import (
     DEFAULT_CHANNEL_ORDER,
     Channel,
@@ -32,8 +39,12 @@ __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_CHANNEL_ORDER",
+    "NO_RETRY",
+    "Attempt",
     "Channel",
     "ChannelAdapter",
+    "DeadLetter",
+    "DeadLetterQueue",
     "DeliveryError",
     "DispatchError",
     "Dispatcher",
@@ -45,6 +56,7 @@ __all__ = [
     "QuietHoursError",
     "Receipt",
     "Recipient",
+    "RetryPolicy",
     "SmsAdapter",
     "Template",
     "TemplateDefinitionError",

@@ -103,6 +103,40 @@ against the dispatcher's clock — pass `now=` for a fixed moment, or
 `Dispatcher(..., clock=...)` to control it everywhere. A window whose start is
 later than its end (22:00–07:00) wraps past midnight.
 
+## Attempts, retries and dead letters
+
+A delivery is attempted once by default. Pass a `RetryPolicy` to try again with
+a growing backoff. Whatever still fails is kept in `dispatcher.dead_letters`
+together with every attempt that was made — a lost notification is something you
+can list, not a line someone has to find in a worker log.
+
+```python
+from notify_dispatch import DeliveryError, Dispatcher, RetryPolicy, SmsAdapter
+
+dispatcher = Dispatcher(
+    [SmsAdapter(lambda phone, body: twilio.messages.create(phone, body).sid)],
+    retry=RetryPolicy(attempts=3, backoff=0.5),  # waits 0.5s, then 1.0s
+)
+
+try:
+    receipt = dispatcher.send(ada, confirmation, context)
+    receipt.attempts  # 2 — the first handover failed
+except DeliveryError as exc:
+    exc.attempts  # every failed handover, each with its error and timestamp
+
+for letter in dispatcher.dead_letters:
+    print(letter.template, letter.address, letter.last_error)
+
+dispatcher.dead_letters.drain()  # hand them over to whoever replays them
+```
+
+The backoff is multiplied per attempt and capped at `max_backoff`, and only
+errors listed in `retry_on` are retried, so a rejected address fails once rather
+than three times. Pass `retry=` to a single `send` to override the dispatcher's
+policy. A `DeadLetterQueue(limit=...)` keeps the newest letters and drops the
+oldest; pass your own queue to share one across dispatchers. Waiting happens on
+the calling thread, so `Dispatcher(..., sleep=...)` is injectable in tests.
+
 ## Development
 
 ```bash

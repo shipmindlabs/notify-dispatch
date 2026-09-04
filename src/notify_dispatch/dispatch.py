@@ -2,17 +2,21 @@
 
 A dispatcher renders a template and hands the result to the adapter for the
 first channel the recipient can actually be reached on. Every adapter satisfies
-the same protocol, so swapping a provider does not touch any call site.
+the same protocol, so swapping a provider does not touch any call site. A
+handover that fails can be retried, and a delivery that never succeeds is kept
+as a dead letter instead of disappearing.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, time
 from enum import Enum
+from time import sleep as _sleep
 from typing import Protocol
 
+from notify_dispatch.delivery import NO_RETRY, Attempt, DeadLetterQueue, RetryPolicy
 from notify_dispatch.templates import Template
 
 __all__ = [
@@ -82,13 +86,23 @@ class QuietHoursError(DispatchError):
 
 
 class DeliveryError(DispatchError):
-    """The adapter for the chosen channel failed to hand the message over."""
+    """Every attempt on the chosen channel failed; the message is a dead letter."""
 
-    def __init__(self, channel: Channel, address: str, cause: BaseException) -> None:
+    def __init__(
+        self,
+        channel: Channel,
+        address: str,
+        cause: BaseException,
+        attempts: Iterable[Attempt] = (),
+    ) -> None:
         self.channel = channel
         self.address = address
         self.cause = cause
-        super().__init__(f"{channel.value} delivery to {address!r} failed: {cause}")
+        self.attempts = tuple(attempts)
+        tried = f" after {len(self.attempts)} attempts" if len(self.attempts) > 1 else ""
+        super().__init__(
+            f"{channel.value} delivery to {address!r} failed{tried}: {cause}"
+        )
 
 
 @dataclass(frozen=True)
@@ -169,10 +183,11 @@ class Message:
 
 @dataclass(frozen=True)
 class Receipt:
-    """What was sent, and the reference the provider gave back."""
+    """What was sent, the reference the provider gave back, and what it took."""
 
     message: Message
     reference: str | None = None
+    attempts: int = 1
 
     @property
     def channel(self) -> Channel:
@@ -231,10 +246,18 @@ class Dispatcher:
         *,
         order: Sequence[Channel] = DEFAULT_CHANNEL_ORDER,
         clock: Callable[[], datetime] = datetime.now,
+        retry: RetryPolicy = NO_RETRY,
+        dead_letters: DeadLetterQueue | None = None,
+        sleep: Callable[[float], None] = _sleep,
     ) -> None:
         self._adapters: dict[Channel, ChannelAdapter] = {}
         self._order = tuple(order)
         self._clock = clock
+        self._retry = retry
+        self._dead_letters = (
+            dead_letters if dead_letters is not None else DeadLetterQueue()
+        )
+        self._sleep = sleep
         for adapter in adapters:
             self.register(adapter)
 
@@ -246,6 +269,15 @@ class Dispatcher:
     def channels(self) -> tuple[Channel, ...]:
         return tuple(channel for channel in self._order if channel in self._adapters)
 
+    @property
+    def dead_letters(self) -> DeadLetterQueue:
+        """The messages that ran out of attempts."""
+        return self._dead_letters
+
+    @property
+    def retry_policy(self) -> RetryPolicy:
+        return self._retry
+
     def send(
         self,
         recipient: Recipient,
@@ -256,6 +288,7 @@ class Dispatcher:
         subject: str | None = None,
         urgency: Urgency = Urgency.NORMAL,
         now: datetime | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Receipt:
         """Render the template and deliver it, or raise before anything is sent."""
         body = template.render(context or {})
@@ -278,15 +311,39 @@ class Dispatcher:
                 subject=subject,
                 urgency=urgency,
             )
-            try:
-                reference = adapter.deliver(message)
-            except Exception as exc:
-                raise DeliveryError(candidate, address, exc) from exc
-            return Receipt(message=message, reference=reference)
+            return self._deliver(adapter, message, retry or self._retry)
         if silenced:
             assert recipient.quiet_hours is not None
             raise QuietHoursError(template.name, silenced, recipient.quiet_hours.end)
         raise UnroutableError(template.name, candidates)
+
+    def _deliver(
+        self, adapter: ChannelAdapter, message: Message, policy: RetryPolicy
+    ) -> Receipt:
+        attempts: list[Attempt] = []
+        number = 0
+        while True:
+            number += 1
+            try:
+                reference = adapter.deliver(message)
+            except Exception as exc:
+                attempts.append(
+                    Attempt(
+                        number=number,
+                        channel=message.channel,
+                        address=message.address,
+                        error=exc,
+                        at=self._clock(),
+                    )
+                )
+                if policy.allows(number, exc):
+                    self._sleep(policy.backoff_for(number))
+                    continue
+                self._dead_letters.record(message, attempts, at=self._clock())
+                raise DeliveryError(
+                    message.channel, message.address, exc, attempts
+                ) from exc
+            return Receipt(message=message, reference=reference, attempts=number)
 
     def _preference(self, recipient: Recipient) -> tuple[Channel, ...]:
         order = list(recipient.preferred)
