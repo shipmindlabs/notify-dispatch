@@ -137,6 +137,34 @@ policy. A `DeadLetterQueue(limit=...)` keeps the newest letters and drops the
 oldest; pass your own queue to share one across dispatchers. Waiting happens on
 the calling thread, so `Dispatcher(..., sleep=...)` is injectable in tests.
 
+## Deduplication
+
+A webhook that is redelivered is the same event twice, not two notifications.
+Pass the id you already have — the upstream delivery id, an outbox row id,
+anything stable across redeliveries — as `dedup_key`, and the second call hands
+back the first receipt instead of sending again.
+
+```python
+receipt = dispatcher.send(
+    ada, confirmation, context, dedup_key=f"order-confirmed:{event_id}"
+)
+receipt.duplicate  # False the first time, True for every redelivery
+```
+
+The key is yours to choose, and choosing it is the whole contract: two sends
+sharing a key are the same notification, so scope it to the event *and* the
+recipient when one event notifies several people. A key is only remembered once
+a provider accepted the handover — an `UnroutableError`, a quiet-hours refusal
+or an exhausted `DeliveryError` leaves it free, so the next redelivery is a real
+attempt. A second send that arrives while the first is still in the air raises
+`DuplicateSendError`.
+
+Keys are kept in memory for `DEFAULT_DEDUP_TTL` (24 hours), long enough to
+outlive a provider's redelivery window. Pass
+`Dispatcher(..., dedup=DedupStore(ttl=...))` to change it or to share one store
+between dispatchers, and call `dispatcher.dedup.purge()` from whatever already
+runs periodically.
+
 ## Development
 
 ```bash

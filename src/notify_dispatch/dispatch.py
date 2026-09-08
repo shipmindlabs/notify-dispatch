@@ -3,19 +3,21 @@
 A dispatcher renders a template and hands the result to the adapter for the
 first channel the recipient can actually be reached on. Every adapter satisfies
 the same protocol, so swapping a provider does not touch any call site. A
-handover that fails can be retried, and a delivery that never succeeds is kept
-as a dead letter instead of disappearing.
+handover that fails can be retried, a delivery that never succeeds is kept as a
+dead letter instead of disappearing, and an event that arrives twice under the
+same dedup key is delivered once.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time
 from enum import Enum
 from time import sleep as _sleep
 from typing import Protocol
 
+from notify_dispatch.dedup import DedupStore
 from notify_dispatch.delivery import NO_RETRY, Attempt, DeadLetterQueue, RetryPolicy
 from notify_dispatch.templates import Template
 
@@ -26,6 +28,7 @@ __all__ = [
     "DeliveryError",
     "DispatchError",
     "Dispatcher",
+    "DuplicateSendError",
     "EmailAdapter",
     "Message",
     "PushAdapter",
@@ -102,6 +105,17 @@ class DeliveryError(DispatchError):
         tried = f" after {len(self.attempts)} attempts" if len(self.attempts) > 1 else ""
         super().__init__(
             f"{channel.value} delivery to {address!r} failed{tried}: {cause}"
+        )
+
+
+class DuplicateSendError(DispatchError):
+    """A send with the same dedup key is still on its way to a provider."""
+
+    def __init__(self, key: str, template: str) -> None:
+        self.key = key
+        self.template = template
+        super().__init__(
+            f"template {template!r} is already in flight for dedup key {key!r}"
         )
 
 
@@ -183,11 +197,16 @@ class Message:
 
 @dataclass(frozen=True)
 class Receipt:
-    """What was sent, the reference the provider gave back, and what it took."""
+    """What was sent, the reference the provider gave back, and what it took.
+
+    A receipt handed back for a repeated dedup key carries ``duplicate=True``
+    and the reference of the delivery that actually happened.
+    """
 
     message: Message
     reference: str | None = None
     attempts: int = 1
+    duplicate: bool = False
 
     @property
     def channel(self) -> Channel:
@@ -248,6 +267,7 @@ class Dispatcher:
         clock: Callable[[], datetime] = datetime.now,
         retry: RetryPolicy = NO_RETRY,
         dead_letters: DeadLetterQueue | None = None,
+        dedup: DedupStore | None = None,
         sleep: Callable[[float], None] = _sleep,
     ) -> None:
         self._adapters: dict[Channel, ChannelAdapter] = {}
@@ -257,6 +277,7 @@ class Dispatcher:
         self._dead_letters = (
             dead_letters if dead_letters is not None else DeadLetterQueue()
         )
+        self._dedup = dedup if dedup is not None else DedupStore()
         self._sleep = sleep
         for adapter in adapters:
             self.register(adapter)
@@ -275,6 +296,11 @@ class Dispatcher:
         return self._dead_letters
 
     @property
+    def dedup(self) -> DedupStore:
+        """The keys that were already delivered."""
+        return self._dedup
+
+    @property
     def retry_policy(self) -> RetryPolicy:
         return self._retry
 
@@ -289,10 +315,61 @@ class Dispatcher:
         urgency: Urgency = Urgency.NORMAL,
         now: datetime | None = None,
         retry: RetryPolicy | None = None,
+        dedup_key: str | None = None,
     ) -> Receipt:
-        """Render the template and deliver it, or raise before anything is sent."""
-        body = template.render(context or {})
+        """Render the template and deliver it, or raise before anything is sent.
+
+        A ``dedup_key`` is remembered only once a provider accepted the message:
+        a redelivery of the same event gets the first receipt back instead of
+        being sent again, while a send that failed leaves the key free.
+        """
         moment = now if now is not None else self._clock()
+        if dedup_key is None:
+            return self._send(
+                recipient,
+                template,
+                context,
+                channel=channel,
+                subject=subject,
+                urgency=urgency,
+                moment=moment,
+                retry=retry,
+            )
+        seen = self._dedup.claim(dedup_key, at=moment)
+        if seen is not None:
+            if seen.receipt is None:
+                raise DuplicateSendError(dedup_key, template.name)
+            return replace(seen.receipt, duplicate=True)
+        try:
+            receipt = self._send(
+                recipient,
+                template,
+                context,
+                channel=channel,
+                subject=subject,
+                urgency=urgency,
+                moment=moment,
+                retry=retry,
+            )
+        except BaseException:
+            self._dedup.release(dedup_key)
+            raise
+        self._dedup.complete(dedup_key, receipt, at=moment)
+        return receipt
+
+    def _send(
+        self,
+        recipient: Recipient,
+        template: Template,
+        context: Mapping[str, object] | None,
+        *,
+        channel: Channel | None,
+        subject: str | None,
+        urgency: Urgency,
+        moment: datetime,
+        retry: RetryPolicy | None,
+    ) -> Receipt:
+        body = template.render(context or {})
         candidates = (channel,) if channel is not None else self._preference(recipient)
         silenced: list[Channel] = []
         for candidate in candidates:

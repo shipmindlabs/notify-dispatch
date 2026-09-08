@@ -1,5 +1,6 @@
 """Template-driven notifications across SMS, push and email."""
 
+from notify_dispatch.dedup import DEFAULT_DEDUP_TTL, DedupRecord, DedupStore
 from notify_dispatch.delivery import (
     NO_RETRY,
     Attempt,
@@ -14,6 +15,7 @@ from notify_dispatch.dispatch import (
     DeliveryError,
     DispatchError,
     Dispatcher,
+    DuplicateSendError,
     EmailAdapter,
     Message,
     PushAdapter,
@@ -39,15 +41,19 @@ __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_CHANNEL_ORDER",
+    "DEFAULT_DEDUP_TTL",
     "NO_RETRY",
     "Attempt",
     "Channel",
     "ChannelAdapter",
     "DeadLetter",
     "DeadLetterQueue",
+    "DedupRecord",
+    "DedupStore",
     "DeliveryError",
     "DispatchError",
     "Dispatcher",
+    "DuplicateSendError",
     "EmailAdapter",
     "Message",
     "MissingVariableError",
