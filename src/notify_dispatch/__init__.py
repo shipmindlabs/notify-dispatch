@@ -27,6 +27,15 @@ from notify_dispatch.dispatch import (
     UnroutableError,
     Urgency,
 )
+from notify_dispatch.locales import (
+    LocaleError,
+    LocaleMismatchError,
+    LocalizedTemplate,
+    MalformedLocaleError,
+    MissingLocaleError,
+    fallback_chain,
+    normalize_locale,
+)
 from notify_dispatch.templates import (
     MissingVariableError,
     Template,
@@ -55,7 +64,12 @@ __all__ = [
     "Dispatcher",
     "DuplicateSendError",
     "EmailAdapter",
+    "LocaleError",
+    "LocaleMismatchError",
+    "LocalizedTemplate",
+    "MalformedLocaleError",
     "Message",
+    "MissingLocaleError",
     "MissingVariableError",
     "PushAdapter",
     "QuietHours",
@@ -73,4 +87,6 @@ __all__ = [
     "Variable",
     "VariableTypeError",
     "__version__",
+    "fallback_chain",
+    "normalize_locale",
 ]

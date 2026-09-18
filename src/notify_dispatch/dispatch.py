@@ -4,8 +4,9 @@ A dispatcher renders a template and hands the result to the adapter for the
 first channel the recipient can actually be reached on. Every adapter satisfies
 the same protocol, so swapping a provider does not touch any call site. A
 handover that fails can be retried, a delivery that never succeeds is kept as a
-dead letter instead of disappearing, and an event that arrives twice under the
-same dedup key is delivered once.
+dead letter instead of disappearing, an event that arrives twice under the same
+dedup key is delivered once, and a recipient with a locale gets the variant of
+the template written in their language.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import Protocol
 
 from notify_dispatch.dedup import DedupStore
 from notify_dispatch.delivery import NO_RETRY, Attempt, DeadLetterQueue, RetryPolicy
+from notify_dispatch.locales import LocalizedTemplate, normalize_locale
 from notify_dispatch.templates import Template
 
 __all__ = [
@@ -150,16 +152,19 @@ class QuietHours:
 
 @dataclass(frozen=True)
 class Recipient:
-    """Where a person can be reached, and how they prefer to be reached."""
+    """Where a person can be reached, how they prefer it, and in which language."""
 
     phone: str | None = None
     device_token: str | None = None
     email: str | None = None
     preferred: tuple[Channel, ...] = ()
     quiet_hours: QuietHours | None = None
+    locale: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "preferred", tuple(self.preferred))
+        if self.locale is not None:
+            object.__setattr__(self, "locale", normalize_locale(self.locale))
 
     def address_for(self, channel: Channel) -> str | None:
         """Return the address for a channel, or None if there is none."""
@@ -193,6 +198,7 @@ class Message:
     address: str
     subject: str | None = None
     urgency: Urgency = Urgency.NORMAL
+    locale: str | None = None
 
 
 @dataclass(frozen=True)
@@ -307,7 +313,7 @@ class Dispatcher:
     def send(
         self,
         recipient: Recipient,
-        template: Template,
+        template: Template | LocalizedTemplate,
         context: Mapping[str, object] | None = None,
         *,
         channel: Channel | None = None,
@@ -316,12 +322,15 @@ class Dispatcher:
         now: datetime | None = None,
         retry: RetryPolicy | None = None,
         dedup_key: str | None = None,
+        locale: str | None = None,
     ) -> Receipt:
         """Render the template and deliver it, or raise before anything is sent.
 
         A ``dedup_key`` is remembered only once a provider accepted the message:
         a redelivery of the same event gets the first receipt back instead of
-        being sent again, while a send that failed leaves the key free.
+        being sent again, while a send that failed leaves the key free. A
+        ``locale`` overrides the recipient's own and is only consulted for a
+        ``LocalizedTemplate``.
         """
         moment = now if now is not None else self._clock()
         if dedup_key is None:
@@ -334,6 +343,7 @@ class Dispatcher:
                 urgency=urgency,
                 moment=moment,
                 retry=retry,
+                locale=locale,
             )
         seen = self._dedup.claim(dedup_key, at=moment)
         if seen is not None:
@@ -350,6 +360,7 @@ class Dispatcher:
                 urgency=urgency,
                 moment=moment,
                 retry=retry,
+                locale=locale,
             )
         except BaseException:
             self._dedup.release(dedup_key)
@@ -360,7 +371,7 @@ class Dispatcher:
     def _send(
         self,
         recipient: Recipient,
-        template: Template,
+        template: Template | LocalizedTemplate,
         context: Mapping[str, object] | None,
         *,
         channel: Channel | None,
@@ -368,8 +379,12 @@ class Dispatcher:
         urgency: Urgency,
         moment: datetime,
         retry: RetryPolicy | None,
+        locale: str | None,
     ) -> Receipt:
-        body = template.render(context or {})
+        chosen, variant = self._localize(
+            template, locale if locale is not None else recipient.locale
+        )
+        body = variant.render(context or {})
         candidates = (channel,) if channel is not None else self._preference(recipient)
         silenced: list[Channel] = []
         for candidate in candidates:
@@ -381,18 +396,26 @@ class Dispatcher:
                 silenced.append(candidate)
                 continue
             message = Message(
-                template=template.name,
+                template=variant.name,
                 body=body,
                 channel=candidate,
                 address=address,
                 subject=subject,
                 urgency=urgency,
+                locale=chosen,
             )
             return self._deliver(adapter, message, retry or self._retry)
         if silenced:
             assert recipient.quiet_hours is not None
-            raise QuietHoursError(template.name, silenced, recipient.quiet_hours.end)
-        raise UnroutableError(template.name, candidates)
+            raise QuietHoursError(variant.name, silenced, recipient.quiet_hours.end)
+        raise UnroutableError(variant.name, candidates)
+
+    def _localize(
+        self, template: Template | LocalizedTemplate, locale: str | None
+    ) -> tuple[str | None, Template]:
+        if isinstance(template, LocalizedTemplate):
+            return template.resolve(locale)
+        return None, template
 
     def _deliver(
         self, adapter: ChannelAdapter, message: Message, policy: RetryPolicy

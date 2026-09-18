@@ -75,6 +75,46 @@ to pin a single channel. If no candidate has both an address and a registered
 adapter, `send` raises `UnroutableError`; if the provider itself fails, the
 error is wrapped in `DeliveryError` carrying the channel and address.
 
+## Locales
+
+A notification is one template with a variant per language, keyed by language
+tag. A request for `de-AT` uses the `de-AT` variant if there is one, then `de`,
+then the default locale — so a new language is a new key, not a new column.
+
+```python
+from notify_dispatch import LocalizedTemplate, Variable
+
+shipped = LocalizedTemplate.from_texts(
+    "order_shipped",
+    {
+        "en": "Order {order_id} is on its way.",
+        "de": "Bestellung {order_id} ist unterwegs.",
+        "pt-BR": "O pedido {order_id} está a caminho.",
+    },
+    variables=(Variable("order_id", str),),
+)
+
+shipped.render({"order_id": "A-1042"}, locale="pt_br")
+# 'O pedido A-1042 está a caminho.'
+
+receipt = dispatcher.send(
+    Recipient(phone="+49151000000", locale="de-AT"), shipped, {"order_id": "A-1042"}
+)
+receipt.message.locale  # 'de' — there is no de-AT variant, so the language matched
+```
+
+Tags are normalised, so `pt_br` and `PT-br` are both `pt-BR`. The chain drops
+one subtag at a time and ends at the default locale — the first variant given,
+unless `default=` names another — so a language nobody translated is sent in the
+default one instead of raising. A bare `pt` does not silently become `pt-BR`:
+only tags you actually wrote are matched.
+
+Every variant declares the same variables, checked when the `LocalizedTemplate`
+is built, so a German text that forgot `{order_id}` raises `LocaleMismatchError`
+there rather than on the first send to a German recipient. `Recipient(locale=…)`
+carries the language, `send(..., locale=…)` overrides it for one message, and
+`receipt.message.locale` records which variant was used.
+
 ## Quiet hours
 
 A recipient can carry a do-not-disturb window. Inside it the silenced channels
