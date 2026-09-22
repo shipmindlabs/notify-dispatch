@@ -2,94 +2,71 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import timedelta
 
 import pytest
+from conftest import ADA, BODY, CONTEXT, NOW, ORDER_CONFIRMED, Recorder
 
 from notify_dispatch import (
     NO_RETRY,
     Channel,
     DeadLetterQueue,
     DeliveryError,
-    Dispatcher,
     EmailAdapter,
     Message,
     Recipient,
     RetryPolicy,
     SmsAdapter,
-    Template,
     UnroutableError,
-    Variable,
 )
 
-ORDER_CONFIRMED = Template(
-    name="order_confirmed",
-    text="Order {order_id} confirmed.",
-    variables=(Variable("order_id", str),),
-)
 
-CONTEXT = {"order_id": "A-1042"}
-NOW = datetime(2026, 3, 1, 10, 0)
-ADA = Recipient(phone="+491")
-
-
-class FlakyProvider:
-    """Fails the first ``failures`` calls, then succeeds."""
-
-    def __init__(
-        self,
-        failures: int = 0,
-        *,
-        reference: str | None = "ref-1",
-        error: BaseException | None = None,
-    ) -> None:
-        self.failures = failures
-        self.reference = reference
-        self.error = error if error is not None else RuntimeError("provider is down")
-        self.calls: list[tuple[str, ...]] = []
-
-    def __call__(self, *args: str) -> str | None:
-        self.calls.append(args)
-        if len(self.calls) <= self.failures:
-            raise self.error
-        return self.reference
-
-
-def make_dispatcher(provider, **kwargs):
-    """Return a dispatcher over SMS plus the list of backoffs it slept."""
-    slept: list[float] = []
-    dispatcher = Dispatcher(
-        [SmsAdapter(provider)], clock=lambda: NOW, sleep=slept.append, **kwargs
-    )
-    return dispatcher, slept
-
-
-def test_a_failed_attempt_is_retried_until_it_succeeds():
-    provider = FlakyProvider(failures=1)
-    dispatcher, slept = make_dispatcher(provider, retry=RetryPolicy(attempts=3))
+def test_a_failed_attempt_is_retried_until_it_succeeds(make_dispatcher, sleeps):
+    provider = Recorder(failures=1)
+    dispatcher = make_dispatcher(SmsAdapter(provider), retry=RetryPolicy(attempts=3))
 
     receipt = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
 
     assert receipt.reference == "ref-1"
     assert receipt.attempts == 2
     assert len(provider.calls) == 2
-    assert slept == [0.5]
+    assert sleeps == [0.5]
     assert len(dispatcher.dead_letters) == 0
 
 
-def test_backoff_grows_per_attempt_and_stops_at_the_maximum():
+def test_backoff_grows_per_attempt_and_stops_at_the_maximum(make_dispatcher, sleeps):
     policy = RetryPolicy(attempts=4, backoff=0.5, multiplier=2.0, max_backoff=1.5)
-    dispatcher, slept = make_dispatcher(FlakyProvider(failures=99), retry=policy)
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)), retry=policy)
 
     with pytest.raises(DeliveryError):
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
 
-    assert slept == [0.5, 1.0, 1.5]
+    assert sleeps == [0.5, 1.0, 1.5]
 
 
-def test_exhausted_attempts_land_in_the_dead_letter_list():
+def test_a_long_backoff_is_recorded_rather_than_waited(make_dispatcher, sleeps):
+    policy = RetryPolicy(attempts=2, backoff=30.0, max_backoff=30.0)
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)), retry=policy)
+
+    with pytest.raises(DeliveryError):
+        dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
+
+    assert sleeps == [30.0]
+
+
+def test_a_successful_first_attempt_waits_for_nothing(make_dispatcher, sleeps):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder()), retry=RetryPolicy(attempts=3))
+
+    receipt = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
+
+    assert receipt.attempts == 1
+    assert sleeps == []
+    assert not dispatcher.dead_letters.letters
+
+
+def test_exhausted_attempts_land_in_the_dead_letter_list(make_dispatcher):
     policy = RetryPolicy(attempts=3, backoff=0.0)
-    dispatcher, _ = make_dispatcher(FlakyProvider(failures=99), retry=policy)
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)), retry=policy)
 
     with pytest.raises(DeliveryError) as excinfo:
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
@@ -100,29 +77,65 @@ def test_exhausted_attempts_land_in_the_dead_letter_list():
     assert letter.template == "order_confirmed"
     assert letter.channel is Channel.SMS
     assert letter.address == "+491"
-    assert letter.message.body == "Order A-1042 confirmed."
+    assert letter.message.body == BODY
     assert isinstance(letter.last_error, RuntimeError)
     assert [attempt.number for attempt in letter.attempts] == [1, 2, 3]
     assert letter.recorded_at == NOW
 
 
-def test_without_a_retry_policy_a_failure_is_attempted_once():
-    provider = FlakyProvider(failures=99)
-    dispatcher, slept = make_dispatcher(provider)
+def test_an_attempt_records_the_channel_and_the_address(make_dispatcher):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)))
+
+    with pytest.raises(DeliveryError) as excinfo:
+        dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
+
+    (attempt,) = excinfo.value.attempts
+    assert attempt.channel is Channel.SMS
+    assert attempt.address == "+491"
+    assert "attempt 1 on sms" in str(attempt)
+
+
+def test_attempts_are_stamped_from_the_injected_clock(make_dispatcher):
+    policy = RetryPolicy(attempts=2, backoff=0.0)
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)), retry=policy)
+
+    with pytest.raises(DeliveryError) as excinfo:
+        dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
+
+    assert [attempt.at for attempt in excinfo.value.attempts] == [NOW, NOW]
+
+
+def test_a_moving_clock_stamps_every_attempt_differently(make_dispatcher, clock):
+    clock.step = timedelta(seconds=5)
+    policy = RetryPolicy(attempts=3, backoff=0.0)
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)), retry=policy)
+
+    with pytest.raises(DeliveryError) as excinfo:
+        dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
+
+    stamps = [attempt.at for attempt in excinfo.value.attempts]
+    assert len(set(stamps)) == 3
+    assert stamps == sorted(stamps)
+    assert dispatcher.dead_letters.letters[0].recorded_at >= stamps[-1]
+
+
+def test_without_a_retry_policy_a_failure_is_attempted_once(make_dispatcher, sleeps):
+    provider = Recorder(failures=99)
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     with pytest.raises(DeliveryError) as excinfo:
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
 
     assert len(provider.calls) == 1
-    assert slept == []
+    assert sleeps == []
     assert len(excinfo.value.attempts) == 1
     assert len(dispatcher.dead_letters) == 1
 
 
-def test_an_error_the_policy_does_not_cover_is_not_retried():
-    provider = FlakyProvider(failures=99, error=ValueError("unknown number"))
+def test_an_error_the_policy_does_not_cover_is_not_retried(make_dispatcher):
+    provider = Recorder(failures=99, error=ValueError("unknown number"))
     policy = RetryPolicy(attempts=3, backoff=0.0, retry_on=(TimeoutError,))
-    dispatcher, _ = make_dispatcher(provider, retry=policy)
+    dispatcher = make_dispatcher(SmsAdapter(provider), retry=policy)
 
     with pytest.raises(DeliveryError):
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
@@ -131,9 +144,9 @@ def test_an_error_the_policy_does_not_cover_is_not_retried():
     assert len(dispatcher.dead_letters) == 1
 
 
-def test_a_per_call_policy_overrides_the_dispatcher_policy():
-    provider = FlakyProvider(failures=1)
-    dispatcher, _ = make_dispatcher(provider)
+def test_a_per_call_policy_overrides_the_dispatcher_policy(make_dispatcher):
+    provider = Recorder(failures=1)
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     receipt = dispatcher.send(
         ADA, ORDER_CONFIRMED, CONTEXT, retry=RetryPolicy(attempts=2, backoff=0.0)
@@ -143,8 +156,20 @@ def test_a_per_call_policy_overrides_the_dispatcher_policy():
     assert len(dispatcher.dead_letters) == 0
 
 
-def test_a_successful_send_records_nothing():
-    dispatcher, _ = make_dispatcher(FlakyProvider())
+def test_a_per_call_policy_may_also_switch_retries_off(make_dispatcher, sleeps):
+    provider = Recorder(failures=1)
+    policy = RetryPolicy(attempts=3, backoff=0.0)
+    dispatcher = make_dispatcher(SmsAdapter(provider), retry=policy)
+
+    with pytest.raises(DeliveryError):
+        dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, retry=NO_RETRY)
+
+    assert len(provider.calls) == 1
+    assert sleeps == []
+
+
+def test_a_successful_send_records_nothing(make_dispatcher):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder()))
 
     receipt = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
 
@@ -152,10 +177,10 @@ def test_a_successful_send_records_nothing():
     assert not dispatcher.dead_letters.letters
 
 
-def test_a_shared_queue_collects_failures_from_several_dispatchers():
+def test_a_shared_queue_collects_failures_from_several_dispatchers(make_dispatcher):
     queue = DeadLetterQueue()
-    sms = Dispatcher([SmsAdapter(FlakyProvider(failures=99))], dead_letters=queue)
-    email = Dispatcher([EmailAdapter(FlakyProvider(failures=99))], dead_letters=queue)
+    sms = make_dispatcher(SmsAdapter(Recorder(failures=99)), dead_letters=queue)
+    email = make_dispatcher(EmailAdapter(Recorder(failures=99)), dead_letters=queue)
 
     with pytest.raises(DeliveryError):
         sms.send(ADA, ORDER_CONFIRMED, CONTEXT)
@@ -165,9 +190,9 @@ def test_a_shared_queue_collects_failures_from_several_dispatchers():
     assert [letter.channel for letter in queue] == [Channel.SMS, Channel.EMAIL]
 
 
-def test_a_limited_queue_keeps_the_most_recent_letters():
+def test_a_limited_queue_keeps_the_most_recent_letters(make_dispatcher):
     queue = DeadLetterQueue(limit=1)
-    dispatcher, _ = make_dispatcher(FlakyProvider(failures=99), dead_letters=queue)
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)), dead_letters=queue)
 
     for phone in ("+491", "+492"):
         with pytest.raises(DeliveryError):
@@ -177,8 +202,8 @@ def test_a_limited_queue_keeps_the_most_recent_letters():
     assert queue.letters[0].address == "+492"
 
 
-def test_draining_the_queue_returns_and_empties_it():
-    dispatcher, _ = make_dispatcher(FlakyProvider(failures=99))
+def test_draining_the_queue_returns_and_empties_it(make_dispatcher):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder(failures=99)))
     with pytest.raises(DeliveryError):
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
 
@@ -188,8 +213,8 @@ def test_draining_the_queue_returns_and_empties_it():
     assert len(dispatcher.dead_letters) == 0
 
 
-def test_a_send_that_never_reached_a_provider_is_not_a_dead_letter():
-    dispatcher, _ = make_dispatcher(FlakyProvider())
+def test_a_send_that_never_reached_a_provider_is_not_a_dead_letter(make_dispatcher):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder()))
 
     with pytest.raises(UnroutableError):
         dispatcher.send(Recipient(email="a@example.com"), ORDER_CONFIRMED, CONTEXT)
@@ -207,6 +232,16 @@ def test_a_policy_retries_only_the_errors_it_names():
     assert policy.allows(1, TimeoutError("slow"))
     assert not policy.allows(1, ValueError("bad address"))
     assert not policy.allows(2, TimeoutError("slow"))
+
+
+def test_backoff_grows_and_then_stays_at_the_maximum():
+    policy = RetryPolicy(attempts=5, backoff=0.5, multiplier=3.0, max_backoff=4.0)
+    assert [policy.backoff_for(number) for number in (1, 2, 3, 4)] == [
+        0.5,
+        1.5,
+        4.0,
+        4.0,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -232,7 +267,7 @@ def test_backoff_is_counted_from_the_first_attempt():
 def test_a_dead_letter_needs_at_least_one_attempt():
     message = Message(
         template="order_confirmed",
-        body="Order A-1042 confirmed.",
+        body=BODY,
         channel=Channel.SMS,
         address="+491",
     )
