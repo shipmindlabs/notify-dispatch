@@ -214,6 +214,10 @@ pip install -e .
 pytest
 ```
 
+The suite reaches no provider and waits for nothing: every adapter hands over to
+a recorder, and every dispatcher is built with the test's own clock and a sleep
+that records the backoff instead of spending it.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

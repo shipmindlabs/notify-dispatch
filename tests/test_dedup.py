@@ -2,82 +2,40 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import timedelta
 
 import pytest
+from conftest import ADA, BODY, CONTEXT, NIGHT, NOW, ORDER_CONFIRMED, OVERNIGHT, Recorder
 
 from notify_dispatch import (
     Channel,
     DedupStore,
     DeliveryError,
-    Dispatcher,
     DuplicateSendError,
     Message,
     MissingVariableError,
-    QuietHours,
     QuietHoursError,
     Receipt,
     Recipient,
+    RetryPolicy,
     SmsAdapter,
-    Template,
     UnroutableError,
-    Variable,
 )
-
-ORDER_CONFIRMED = Template(
-    name="order_confirmed",
-    text="Order {order_id} confirmed.",
-    variables=(Variable("order_id", str),),
-)
-
-CONTEXT = {"order_id": "A-1042"}
-NOW = datetime(2026, 3, 1, 10, 0)
-NIGHT = datetime(2026, 3, 1, 23, 30)
-ADA = Recipient(phone="+491")
-
-
-class Provider:
-    """Counts handovers and can be switched to failing."""
-
-    def __init__(self, fail: bool = False) -> None:
-        self.fail = fail
-        self.calls: list[tuple[str, ...]] = []
-
-    def __call__(self, *args: str) -> str | None:
-        self.calls.append(args)
-        if self.fail:
-            raise RuntimeError("provider is down")
-        return f"ref-{len(self.calls)}"
-
-
-class Clock:
-    def __init__(self, now: datetime = NOW) -> None:
-        self.now = now
-
-    def __call__(self) -> datetime:
-        return self.now
-
-    def advance(self, delta: timedelta) -> None:
-        self.now += delta
-
-
-def make_dispatcher(provider, **kwargs):
-    return Dispatcher([SmsAdapter(provider)], clock=Clock(), **kwargs)
 
 
 def a_receipt() -> Receipt:
     message = Message(
         template="order_confirmed",
-        body="Order A-1042 confirmed.",
+        body=BODY,
         channel=Channel.SMS,
         address="+491",
     )
     return Receipt(message=message, reference="ref-1")
 
 
-def test_the_same_key_is_delivered_once():
-    provider = Provider()
-    dispatcher = make_dispatcher(provider)
+def test_the_same_key_is_delivered_once(make_dispatcher):
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     first = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
     second = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
@@ -90,9 +48,9 @@ def test_the_same_key_is_delivered_once():
     assert len(dispatcher.dedup) == 1
 
 
-def test_different_keys_are_both_delivered():
-    provider = Provider()
-    dispatcher = make_dispatcher(provider)
+def test_different_keys_are_both_delivered(make_dispatcher):
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
     receipt = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-2")
@@ -101,9 +59,9 @@ def test_different_keys_are_both_delivered():
     assert not receipt.duplicate
 
 
-def test_without_a_key_nothing_is_deduplicated():
-    provider = Provider()
-    dispatcher = make_dispatcher(provider)
+def test_without_a_key_nothing_is_deduplicated(make_dispatcher):
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
     dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT)
@@ -112,26 +70,47 @@ def test_without_a_key_nothing_is_deduplicated():
     assert len(dispatcher.dedup) == 0
 
 
-def test_a_failed_delivery_leaves_the_key_free():
-    provider = Provider(fail=True)
-    dispatcher = make_dispatcher(provider)
+def test_a_failed_delivery_leaves_the_key_free(make_dispatcher):
+    provider = Recorder(failures=1)
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     with pytest.raises(DeliveryError):
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
-    provider.fail = False
     receipt = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
 
     assert len(provider.calls) == 2
     assert not receipt.duplicate
+    assert len(dispatcher.dead_letters) == 1
 
 
-def test_an_unroutable_send_leaves_the_key_free():
-    provider = Provider()
-    dispatcher = make_dispatcher(provider)
+def test_a_key_is_remembered_with_the_receipt_the_retries_produced(
+    make_dispatcher, sleeps
+):
+    provider = Recorder(failures=1)
+    dispatcher = make_dispatcher(
+        SmsAdapter(provider), retry=RetryPolicy(attempts=2, backoff=0.25)
+    )
+
+    first = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
+    second = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
+
+    assert first.attempts == 2
+    assert second.attempts == 2
+    assert second.duplicate
+    assert len(provider.calls) == 2
+    assert sleeps == [0.25]
+
+
+def test_an_unroutable_send_leaves_the_key_free(make_dispatcher):
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     with pytest.raises(UnroutableError):
         dispatcher.send(
-            Recipient(email="a@example.com"), ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1"
+            Recipient(email="a@example.com"),
+            ORDER_CONFIRMED,
+            CONTEXT,
+            dedup_key="evt-1",
         )
     receipt = dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
 
@@ -139,12 +118,10 @@ def test_an_unroutable_send_leaves_the_key_free():
     assert len(provider.calls) == 1
 
 
-def test_a_quiet_hours_refusal_leaves_the_key_free():
-    provider = Provider()
-    dispatcher = Dispatcher([SmsAdapter(provider)], clock=Clock())
-    recipient = Recipient(
-        phone="+491", quiet_hours=QuietHours(start=time(22, 0), end=time(7, 0))
-    )
+def test_a_quiet_hours_refusal_leaves_the_key_free(make_dispatcher):
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider))
+    recipient = Recipient(phone="+491", quiet_hours=OVERNIGHT)
 
     with pytest.raises(QuietHoursError):
         dispatcher.send(
@@ -156,9 +133,9 @@ def test_a_quiet_hours_refusal_leaves_the_key_free():
     assert len(provider.calls) == 1
 
 
-def test_a_template_error_leaves_the_key_free():
-    provider = Provider()
-    dispatcher = make_dispatcher(provider)
+def test_a_template_error_leaves_the_key_free(make_dispatcher):
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider))
 
     with pytest.raises(MissingVariableError):
         dispatcher.send(ADA, ORDER_CONFIRMED, {}, dedup_key="evt-1")
@@ -168,11 +145,11 @@ def test_a_template_error_leaves_the_key_free():
     assert len(provider.calls) == 1
 
 
-def test_a_key_still_in_flight_is_rejected():
+def test_a_key_still_in_flight_is_rejected(make_dispatcher):
     store = DedupStore()
     store.claim("evt-1", at=NOW)
-    provider = Provider()
-    dispatcher = make_dispatcher(provider, dedup=store)
+    provider = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(provider), dedup=store)
 
     with pytest.raises(DuplicateSendError) as excinfo:
         dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
@@ -181,13 +158,10 @@ def test_a_key_still_in_flight_is_rejected():
     assert not provider.calls
 
 
-def test_a_key_expires_after_the_ttl():
-    provider = Provider()
-    clock = Clock()
-    dispatcher = Dispatcher(
-        [SmsAdapter(provider)],
-        clock=clock,
-        dedup=DedupStore(ttl=timedelta(hours=1)),
+def test_a_key_expires_after_the_ttl(make_dispatcher, clock):
+    provider = Recorder()
+    dispatcher = make_dispatcher(
+        SmsAdapter(provider), dedup=DedupStore(ttl=timedelta(hours=1))
     )
 
     dispatcher.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
@@ -198,11 +172,11 @@ def test_a_key_expires_after_the_ttl():
     assert not receipt.duplicate
 
 
-def test_a_shared_store_deduplicates_across_dispatchers():
+def test_a_shared_store_deduplicates_across_dispatchers(make_dispatcher):
     store = DedupStore()
-    first, second = Provider(), Provider()
-    worker_a = make_dispatcher(first, dedup=store)
-    worker_b = make_dispatcher(second, dedup=store)
+    first, second = Recorder(), Recorder()
+    worker_a = make_dispatcher(SmsAdapter(first), dedup=store)
+    worker_b = make_dispatcher(SmsAdapter(second), dedup=store)
 
     worker_a.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")
     receipt = worker_b.send(ADA, ORDER_CONFIRMED, CONTEXT, dedup_key="evt-1")

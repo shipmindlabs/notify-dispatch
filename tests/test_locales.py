@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import pytest
+from conftest import CONTEXT, Recorder
 
 from notify_dispatch import (
     Channel,
-    Dispatcher,
     LocaleError,
     LocaleMismatchError,
     LocalizedTemplate,
@@ -14,6 +14,7 @@ from notify_dispatch import (
     MissingLocaleError,
     MissingVariableError,
     Recipient,
+    RetryPolicy,
     SmsAdapter,
     Template,
     Variable,
@@ -30,19 +31,6 @@ TEXTS = {
 }
 
 SHIPPED = LocalizedTemplate.from_texts("order_shipped", TEXTS, variables=ORDER_ID)
-
-CONTEXT = {"order_id": "A-1042"}
-
-
-class Provider:
-    """Records what a provider was asked to send."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, ...]] = []
-
-    def __call__(self, *args: str) -> str | None:
-        self.calls.append(args)
-        return "ref-1"
 
 
 def test_an_exact_locale_uses_its_own_variant():
@@ -178,22 +166,20 @@ def test_a_missing_value_still_raises_in_the_localized_path():
         SHIPPED.render({}, locale="de")
 
 
-def test_a_recipient_locale_picks_the_variant():
-    sms = Provider()
-    dispatcher = Dispatcher([SmsAdapter(sms)])
+def test_a_recipient_locale_picks_the_variant(make_dispatcher):
+    sms = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(sms))
 
-    receipt = dispatcher.send(
-        Recipient(phone="+491", locale="de-AT"), SHIPPED, CONTEXT
-    )
+    receipt = dispatcher.send(Recipient(phone="+491", locale="de-AT"), SHIPPED, CONTEXT)
 
     assert receipt.message.locale == "de"
     assert receipt.channel is Channel.SMS
     assert sms.calls == [("+491", "Bestellung A-1042 ist unterwegs.")]
 
 
-def test_an_explicit_locale_overrides_the_recipient():
-    sms = Provider()
-    dispatcher = Dispatcher([SmsAdapter(sms)])
+def test_an_explicit_locale_overrides_the_recipient(make_dispatcher):
+    sms = Recorder()
+    dispatcher = make_dispatcher(SmsAdapter(sms))
 
     receipt = dispatcher.send(
         Recipient(phone="+491", locale="de"), SHIPPED, CONTEXT, locale="pt-BR"
@@ -203,8 +189,8 @@ def test_an_explicit_locale_overrides_the_recipient():
     assert sms.calls == [("+491", "O pedido A-1042 está a caminho.")]
 
 
-def test_a_recipient_without_a_locale_gets_the_default():
-    dispatcher = Dispatcher([SmsAdapter(Provider())])
+def test_a_recipient_without_a_locale_gets_the_default(make_dispatcher):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder()))
 
     receipt = dispatcher.send(Recipient(phone="+491"), SHIPPED, CONTEXT)
 
@@ -212,16 +198,31 @@ def test_a_recipient_without_a_locale_gets_the_default():
     assert receipt.message.body == "Order A-1042 is on its way."
 
 
-def test_a_plain_template_is_sent_without_a_locale():
-    dispatcher = Dispatcher([SmsAdapter(Provider())])
+def test_a_plain_template_is_sent_without_a_locale(make_dispatcher):
+    dispatcher = make_dispatcher(SmsAdapter(Recorder()))
     template = Template("order_shipped", TEXTS["en"], ORDER_ID)
 
-    receipt = dispatcher.send(
-        Recipient(phone="+491", locale="de"), template, CONTEXT
-    )
+    receipt = dispatcher.send(Recipient(phone="+491", locale="de"), template, CONTEXT)
 
     assert receipt.message.locale is None
     assert receipt.message.body == "Order A-1042 is on its way."
+
+
+def test_a_localized_body_is_rendered_once_and_retried_as_is(make_dispatcher, sleeps):
+    sms = Recorder(failures=1)
+    dispatcher = make_dispatcher(
+        SmsAdapter(sms), retry=RetryPolicy(attempts=2, backoff=0.25)
+    )
+
+    receipt = dispatcher.send(Recipient(phone="+491", locale="de-AT"), SHIPPED, CONTEXT)
+
+    first, second = sms.bodies
+    # the same string object twice: one variant rendered once, handed over twice
+    assert first is second
+    assert first == "Bestellung A-1042 ist unterwegs."
+    assert receipt.message.locale == "de"
+    assert receipt.attempts == 2
+    assert sleeps == [0.25]
 
 
 def test_a_recipient_normalizes_its_locale():
