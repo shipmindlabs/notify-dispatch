@@ -3,6 +3,11 @@
 Template-driven notifications across SMS, push and email: one dispatch API,
 provider adapters, background delivery.
 
+A notification is a template, a recipient and one call. The dispatcher renders
+the text, hands it to the first channel the recipient can actually be reached
+on, and — once you name the event — delivers it a single time, however often
+that event arrives.
+
 ## Status
 
 Pre-alpha. The public API is not stable yet.
@@ -39,27 +44,86 @@ confirmation.render({"order_id": "A-1042", "item_count": 3})
 # MissingVariableError: template 'order_confirmed' is missing values for: total
 ```
 
-Rendering raises `MissingVariableError`, `UnknownVariableError` or
-`VariableTypeError`. A template whose text and declaration disagree — an
-undeclared `{placeholder}`, or a declared variable the text never uses — raises
-`TemplateDefinitionError` at construction time.
+The rules a template is held to:
 
-## Sending
+- **Text and declaration must agree.** An undeclared `{placeholder}`, a declared
+  variable the text never uses, or the same name declared twice raises
+  `TemplateDefinitionError` at construction time — before the template is ever
+  sent.
+- **Placeholders are plain names.** `{}`, `{0}`, `{order.id}` and nested format
+  specs are rejected; a format spec on a name (`{total:.2f}`) is not.
+- **Values are checked at render time**, and raise `MissingVariableError`,
+  `UnknownVariableError` or `VariableTypeError` — the last one also for a `bool`
+  where `int` or `float` is declared, because a flag where a count belongs is a
+  bug rather than a `1`.
+- **A send renders once.** The body is produced before any channel is chosen, so
+  a template error never reaches a provider, and every retry hands over the same
+  string.
 
-One call sends a notification. The dispatcher renders the template and picks the
-first channel the recipient can be reached on; SMS, push and email are adapters
-behind the same protocol.
+## Channels
+
+A channel is an adapter: an object with a `channel` and a `deliver(message)`
+that hands the rendered body to a provider and returns whatever reference the
+provider gives back. Three adapters ship with the package, one per channel.
+
+| Channel        | Address on `Recipient` | Adapter        | Provider is called with    |
+| -------------- | ---------------------- | -------------- | -------------------------- |
+| `Channel.PUSH` | `device_token`         | `PushAdapter`  | `(token, body)`            |
+| `Channel.SMS`  | `phone`                | `SmsAdapter`   | `(phone, body)`            |
+| `Channel.EMAIL`| `email`                | `EmailAdapter` | `(address, subject, body)` |
 
 ```python
 from notify_dispatch import (
-    Dispatcher, EmailAdapter, PushAdapter, Recipient, SmsAdapter,
+    Channel, Dispatcher, EmailAdapter, PushAdapter, SmsAdapter,
 )
 
 dispatcher = Dispatcher([
     PushAdapter(lambda token, body: fcm.send(token, body)),
     SmsAdapter(lambda phone, body: twilio.messages.create(phone, body).sid),
-    EmailAdapter(lambda address, subject, body: ses.send(address, subject, body)),
+    EmailAdapter(
+        lambda address, subject, body: ses.send(address, subject, body),
+        default_subject="Notification",
+    ),
 ])
+
+dispatcher.channels  # (<Channel.PUSH: 'push'>, <Channel.SMS: 'sms'>, <Channel.EMAIL: 'email'>)
+```
+
+A dispatcher holds at most one adapter per channel: `register()` adds one later
+and replaces whatever was there, which is how a provider is swapped without
+touching a call site. `Dispatcher(..., order=(Channel.EMAIL, Channel.SMS))`
+changes which channel is tried first, and `dispatcher.channels` reports the
+registered channels in that order.
+
+Anything satisfying the `ChannelAdapter` protocol is an adapter, so a provider
+whose call does not fit the three shipped ones needs no subclassing:
+
+```python
+from dataclasses import dataclass
+
+from notify_dispatch import Channel, Message
+
+@dataclass(frozen=True)
+class ShortCodeAdapter:
+    channel: Channel = Channel.SMS
+
+    def deliver(self, message: Message) -> str | None:
+        return gateway.publish(to=message.address, text=message.body).id
+
+dispatcher.register(ShortCodeAdapter())
+```
+
+The `Message` an adapter receives carries the template name, the rendered body,
+the channel and address it was routed to, the subject, the urgency and the
+locale that was used.
+
+## Sending
+
+One call sends a notification. The dispatcher renders the template and picks the
+first channel the recipient can be reached on.
+
+```python
+from notify_dispatch import Recipient
 
 receipt = dispatcher.send(
     Recipient(phone="+49151000000", email="ada@example.com"),
@@ -71,9 +135,10 @@ receipt.channel  # <Channel.SMS: 'sms'> — no device token, so push was skipped
 
 Routing follows the recipient's `preferred` channels first, then the
 dispatcher's order (push, SMS, email by default). Pass `channel=Channel.EMAIL`
-to pin a single channel. If no candidate has both an address and a registered
-adapter, `send` raises `UnroutableError`; if the provider itself fails, the
-error is wrapped in `DeliveryError` carrying the channel and address.
+to pin a single channel. A candidate without an address, or without a registered
+adapter, is skipped. If none is left, `send` raises `UnroutableError`; if the
+provider itself fails, the error is wrapped in `DeliveryError` carrying the
+channel and address.
 
 ## Locales
 
@@ -191,19 +256,42 @@ receipt = dispatcher.send(
 receipt.duplicate  # False the first time, True for every redelivery
 ```
 
-The key is yours to choose, and choosing it is the whole contract: two sends
-sharing a key are the same notification, so scope it to the event *and* the
-recipient when one event notifies several people. A key is only remembered once
-a provider accepted the handover — an `UnroutableError`, a quiet-hours refusal
-or an exhausted `DeliveryError` leaves it free, so the next redelivery is a real
-attempt. A second send that arrives while the first is still in the air raises
-`DuplicateSendError`.
+The key is yours to choose, and choosing it is the whole contract:
 
-Keys are kept in memory for `DEFAULT_DEDUP_TTL` (24 hours), long enough to
-outlive a provider's redelivery window. Pass
-`Dispatcher(..., dedup=DedupStore(ttl=...))` to change it or to share one store
-between dispatchers, and call `dispatcher.dedup.purge()` from whatever already
-runs periodically.
+- **A key names an event, not a call.** Two sends sharing a key are the same
+  notification, so scope the key to the event *and* the recipient when one event
+  notifies several people.
+- **A key is remembered only once a provider accepted the handover.** A template
+  error, an `UnroutableError`, a quiet-hours refusal or an exhausted
+  `DeliveryError` leaves the key free, so the next redelivery is a real attempt.
+  What is remembered is the receipt the retries produced, not the first try.
+- **A repeat is not sent, and not even rendered.** The first receipt comes back
+  with `duplicate=True`; its reference, channel and attempt count are those of
+  the delivery that actually happened.
+- **A key still in flight raises `DuplicateSendError`.** A second send that
+  arrives while the first is on its way to a provider is refused rather than
+  queued or silently dropped.
+- **A key is forgotten after its ttl**, counted from the moment it completed.
+  `DEFAULT_DEDUP_TTL` is 24 hours, long enough to outlive a provider's
+  redelivery window.
+
+```python
+from datetime import timedelta
+
+from notify_dispatch import DedupStore
+
+store = DedupStore(ttl=timedelta(hours=6))
+dispatcher = Dispatcher(adapters, dedup=store)
+
+store.get("order-confirmed:evt-1")  # the DedupRecord, or None if it is unknown
+store.purge()                        # drop what is past its ttl
+```
+
+Pass `ttl=None` to remember keys for as long as the process lives, hand the same
+store to several dispatchers to deduplicate across them, and call
+`dispatcher.dedup.purge()` from whatever already runs periodically. The store
+keeps its keys in memory: one process deduplicates against itself, and two
+processes share nothing unless something else in front of them does.
 
 ## Development
 
