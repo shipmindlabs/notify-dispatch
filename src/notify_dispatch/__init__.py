@@ -36,6 +36,13 @@ from notify_dispatch.locales import (
     fallback_chain,
     normalize_locale,
 )
+from notify_dispatch.outbox import (
+    Outbox,
+    Ticket,
+    TicketPendingError,
+    TicketState,
+    Worker,
+)
 from notify_dispatch.templates import (
     MissingVariableError,
     Template,
@@ -71,6 +78,7 @@ __all__ = [
     "Message",
     "MissingLocaleError",
     "MissingVariableError",
+    "Outbox",
     "PushAdapter",
     "QuietHours",
     "QuietHoursError",
@@ -81,11 +89,15 @@ __all__ = [
     "Template",
     "TemplateDefinitionError",
     "TemplateError",
+    "Ticket",
+    "TicketPendingError",
+    "TicketState",
     "UnknownVariableError",
     "UnroutableError",
     "Urgency",
     "Variable",
     "VariableTypeError",
+    "Worker",
     "__version__",
     "fallback_chain",
     "normalize_locale",
