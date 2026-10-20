@@ -293,6 +293,70 @@ store to several dispatchers to deduplicate across them, and call
 keeps its keys in memory: one process deduplicates against itself, and two
 processes share nothing unless something else in front of them does.
 
+## The outbox
+
+A notification caused by a web request should not make that request wait for a
+provider. An `Outbox` takes the call `Dispatcher.send` takes, hands back a
+`Ticket` and touches nothing; whoever drains it does the sending.
+
+```python
+from notify_dispatch import Outbox
+
+outbox = Outbox(dispatcher)
+
+ticket = outbox.enqueue(ada, confirmation, context)
+ticket.state     # <TicketState.PENDING: 'pending'> — no provider was reached
+len(outbox)      # 1
+
+outbox.drain()   # sends on the calling thread, in the order the tickets arrived
+ticket.result()  # the Receipt, or whatever the send raised
+```
+
+Every keyword `send` accepts — `channel`, `subject`, `urgency`, `now`, `retry`,
+`dedup_key`, `locale` — is accepted by `enqueue` and handed over unchanged when
+the ticket is drained, so routing, quiet hours, retries and deduplication behave
+exactly as they do on a direct send. The context is copied into the ticket, so a
+dict the caller goes on mutating cannot change the message that is sent.
+
+A drain settles every ticket it handles, and a ticket is the place to look:
+
+- A send that worked leaves the ticket `SENT` with its `receipt`, and `result()`
+  returns it.
+- A send that raised leaves the ticket `FAILED` with its `error`, and `result()`
+  raises it again. The drain carries on to the next ticket, so one unroutable
+  recipient does not strand everything queued behind it.
+- A ticket nobody has drained is still `PENDING`, and asking for its `result()`
+  raises `TicketPendingError` rather than handing back a `None` receipt.
+- `drain(limit=n)` sends at most `n` tickets and leaves the rest queued, which is
+  how a drain is kept short enough to interleave with other work.
+
+## Workers
+
+A `Worker` is that drain on a thread of its own.
+
+```python
+from notify_dispatch import Worker
+
+worker = Worker(outbox, interval=0.05).start()
+...
+worker.stop()
+
+# or, scoped to a block:
+with Worker(outbox) as worker:
+    outbox.enqueue(ada, confirmation, context)
+```
+
+The loop waits for a ticket to arrive rather than polling a fixed schedule, and
+`interval` is only how long it waits before checking whether it has been asked
+to stop. `stop()` drains what is still queued before the thread ends, so a
+shutdown does not throw away the tickets that were accepted a moment earlier.
+`ticket.wait(timeout)` blocks until a ticket settles, for the caller that does
+want the outcome after all.
+
+The queue lives in memory, like the dedup store: it survives the request that
+enqueued the notification, not the process that holds it. Durability across
+restarts is the job of whatever you put behind `enqueue`.
+
 ## Development
 
 ```bash
@@ -303,8 +367,9 @@ pytest
 ```
 
 The suite reaches no provider and waits for nothing: every adapter hands over to
-a recorder, and every dispatcher is built with the test's own clock and a sleep
-that records the backoff instead of spending it.
+a recorder, every dispatcher is built with the test's own clock and a sleep that
+records the backoff instead of spending it, and the outbox is drained by the
+test rather than by a thread it has to wait for.
 
 ## License
 
