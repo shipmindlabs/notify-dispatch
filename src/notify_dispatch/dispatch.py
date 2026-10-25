@@ -3,10 +3,11 @@
 A dispatcher renders a template and hands the result to the adapter for the
 first channel the recipient can actually be reached on. Every adapter satisfies
 the same protocol, so swapping a provider does not touch any call site. A
-handover that fails can be retried, a delivery that never succeeds is kept as a
-dead letter instead of disappearing, an event that arrives twice under the same
-dedup key is delivered once, and a recipient with a locale gets the variant of
-the template written in their language.
+handover that fails can be retried, a channel that has used up its attempts can
+fall back to the next one the recipient is reachable on, a delivery that never
+succeeds is kept as a dead letter instead of disappearing, an event that arrives
+twice under the same dedup key is delivered once, and a recipient with a locale
+gets the variant of the template written in their language.
 """
 
 from __future__ import annotations
@@ -91,7 +92,11 @@ class QuietHoursError(DispatchError):
 
 
 class DeliveryError(DispatchError):
-    """Every attempt on the chosen channel failed; the message is a dead letter."""
+    """Every attempt on every channel tried failed; the message is a dead letter.
+
+    ``channel`` and ``address`` are those of the last channel tried; ``attempts``
+    holds every handover, from every channel.
+    """
 
     def __init__(
         self,
@@ -205,8 +210,10 @@ class Message:
 class Receipt:
     """What was sent, the reference the provider gave back, and what it took.
 
-    A receipt handed back for a repeated dedup key carries ``duplicate=True``
-    and the reference of the delivery that actually happened.
+    ``attempts`` counts every handover the notification took, including the ones
+    on a channel that was given up on. A receipt handed back for a repeated
+    dedup key carries ``duplicate=True`` and the reference of the delivery that
+    actually happened.
     """
 
     message: Message
@@ -263,7 +270,7 @@ class EmailAdapter:
 
 
 class Dispatcher:
-    """Renders a template once and delivers it over a single chosen channel."""
+    """Renders a template once and delivers it over the channels it routes to."""
 
     def __init__(
         self,
@@ -272,6 +279,7 @@ class Dispatcher:
         order: Sequence[Channel] = DEFAULT_CHANNEL_ORDER,
         clock: Callable[[], datetime] = datetime.now,
         retry: RetryPolicy = NO_RETRY,
+        fallback: bool = False,
         dead_letters: DeadLetterQueue | None = None,
         dedup: DedupStore | None = None,
         sleep: Callable[[float], None] = _sleep,
@@ -280,6 +288,7 @@ class Dispatcher:
         self._order = tuple(order)
         self._clock = clock
         self._retry = retry
+        self._fallback = fallback
         self._dead_letters = (
             dead_letters if dead_letters is not None else DeadLetterQueue()
         )
@@ -310,6 +319,11 @@ class Dispatcher:
     def retry_policy(self) -> RetryPolicy:
         return self._retry
 
+    @property
+    def fallback(self) -> bool:
+        """Whether an exhausted channel hands the message to the next one."""
+        return self._fallback
+
     def send(
         self,
         recipient: Recipient,
@@ -321,16 +335,19 @@ class Dispatcher:
         urgency: Urgency = Urgency.NORMAL,
         now: datetime | None = None,
         retry: RetryPolicy | None = None,
+        fallback: bool | None = None,
         dedup_key: str | None = None,
         locale: str | None = None,
     ) -> Receipt:
         """Render the template and deliver it, or raise before anything is sent.
 
-        A ``dedup_key`` is remembered only once a provider accepted the message:
-        a redelivery of the same event gets the first receipt back instead of
-        being sent again, while a send that failed leaves the key free. A
-        ``locale`` overrides the recipient's own and is only consulted for a
-        ``LocalizedTemplate``.
+        With ``fallback`` the next reachable, unsilenced channel is tried once a
+        channel has used up its attempts, and only an exhausted last channel
+        writes a dead letter. A ``dedup_key`` is remembered only once a provider
+        accepted the message: a redelivery of the same event gets the first
+        receipt back instead of being sent again, while a send that failed
+        leaves the key free. A ``locale`` overrides the recipient's own and is
+        only consulted for a ``LocalizedTemplate``.
         """
         moment = now if now is not None else self._clock()
         if dedup_key is None:
@@ -343,6 +360,7 @@ class Dispatcher:
                 urgency=urgency,
                 moment=moment,
                 retry=retry,
+                fallback=fallback,
                 locale=locale,
             )
         seen = self._dedup.claim(dedup_key, at=moment)
@@ -360,6 +378,7 @@ class Dispatcher:
                 urgency=urgency,
                 moment=moment,
                 retry=retry,
+                fallback=fallback,
                 locale=locale,
             )
         except BaseException:
@@ -379,6 +398,7 @@ class Dispatcher:
         urgency: Urgency,
         moment: datetime,
         retry: RetryPolicy | None,
+        fallback: bool | None,
         locale: str | None,
     ) -> Receipt:
         chosen, variant = self._localize(
@@ -386,6 +406,8 @@ class Dispatcher:
         )
         body = variant.render(context or {})
         candidates = (channel,) if channel is not None else self._preference(recipient)
+        may_fall_back = fallback if fallback is not None else self._fallback
+        routes: list[tuple[ChannelAdapter, Message]] = []
         silenced: list[Channel] = []
         for candidate in candidates:
             address = recipient.address_for(candidate)
@@ -404,7 +426,11 @@ class Dispatcher:
                 urgency=urgency,
                 locale=chosen,
             )
-            return self._deliver(adapter, message, retry or self._retry)
+            routes.append((adapter, message))
+            if not may_fall_back:
+                break
+        if routes:
+            return self._deliver(routes, retry or self._retry)
         if silenced:
             assert recipient.quiet_hours is not None
             raise QuietHoursError(variant.name, silenced, recipient.quiet_hours.end)
@@ -418,32 +444,41 @@ class Dispatcher:
         return None, template
 
     def _deliver(
-        self, adapter: ChannelAdapter, message: Message, policy: RetryPolicy
+        self,
+        routes: Sequence[tuple[ChannelAdapter, Message]],
+        policy: RetryPolicy,
     ) -> Receipt:
         attempts: list[Attempt] = []
-        number = 0
-        while True:
-            number += 1
-            try:
-                reference = adapter.deliver(message)
-            except Exception as exc:
-                attempts.append(
-                    Attempt(
-                        number=number,
-                        channel=message.channel,
-                        address=message.address,
-                        error=exc,
-                        at=self._clock(),
+        for adapter, message in routes:
+            # the policy is a budget per channel, so the next one starts fresh
+            on_channel = 0
+            while True:
+                on_channel += 1
+                try:
+                    reference = adapter.deliver(message)
+                except Exception as exc:
+                    attempts.append(
+                        Attempt(
+                            number=len(attempts) + 1,
+                            channel=message.channel,
+                            address=message.address,
+                            error=exc,
+                            at=self._clock(),
+                        )
                     )
+                    if policy.allows(on_channel, exc):
+                        self._sleep(policy.backoff_for(on_channel))
+                        continue
+                    break
+                return Receipt(
+                    message=message, reference=reference, attempts=len(attempts) + 1
                 )
-                if policy.allows(number, exc):
-                    self._sleep(policy.backoff_for(number))
-                    continue
-                self._dead_letters.record(message, attempts, at=self._clock())
-                raise DeliveryError(
-                    message.channel, message.address, exc, attempts
-                ) from exc
-            return Receipt(message=message, reference=reference, attempts=number)
+        exhausted = routes[-1][1]
+        error = attempts[-1].error
+        self._dead_letters.record(exhausted, attempts, at=self._clock())
+        raise DeliveryError(
+            exhausted.channel, exhausted.address, error, attempts
+        ) from error
 
     def _preference(self, recipient: Recipient) -> tuple[Channel, ...]:
         order = list(recipient.preferred)

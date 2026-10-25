@@ -242,6 +242,40 @@ policy. A `DeadLetterQueue(limit=...)` keeps the newest letters and drops the
 oldest; pass your own queue to share one across dispatchers. Waiting happens on
 the calling thread, so `Dispatcher(..., sleep=...)` is injectable in tests.
 
+## Falling back to another channel
+
+A push token a device discarded months ago is a poor reason to give up on a
+notification when the same person also has a phone number. Pass `fallback=True`
+and, once every attempt on the chosen channel is used up, the next reachable,
+unsilenced channel is tried before anything is written off.
+
+```python
+dispatcher = Dispatcher(
+    [PushAdapter(push_provider), SmsAdapter(sms_provider)],
+    retry=RetryPolicy(attempts=2, backoff=0.5),
+    fallback=True,
+)
+
+receipt = dispatcher.send(ada, confirmation, context)
+receipt.channel          # <Channel.SMS: 'sms'> — push was tried twice first
+receipt.attempts         # 3 — every handover, on every channel
+dispatcher.dead_letters  # empty: the notification arrived
+```
+
+Fallback is off by default, and `send(..., fallback=...)` decides it for a single
+call. The fallbacks are routed exactly as the first channel is — the recipient's
+preferences, then the dispatcher's order, skipping a channel without an address,
+without an adapter, or inside quiet hours. A pinned `channel=` is one candidate
+and so has nothing to fall back to.
+
+The retry policy is a budget per channel: `attempts=2` is two handovers to push
+and then two to SMS, and the backoff is waited between attempts on the same
+channel, not between channels. Only when the last channel is exhausted does a
+dead letter appear — one letter, naming the last channel tried and carrying
+every attempt from every channel, which is also the list on the `DeliveryError`.
+A `dedup_key` is remembered only once a provider accepted, so the receipt it
+keeps names the channel that worked.
+
 ## Deduplication
 
 A webhook that is redelivered is the same event twice, not two notifications.
@@ -313,10 +347,11 @@ ticket.result()  # the Receipt, or whatever the send raised
 ```
 
 Every keyword `send` accepts — `channel`, `subject`, `urgency`, `now`, `retry`,
-`dedup_key`, `locale` — is accepted by `enqueue` and handed over unchanged when
-the ticket is drained, so routing, quiet hours, retries and deduplication behave
-exactly as they do on a direct send. The context is copied into the ticket, so a
-dict the caller goes on mutating cannot change the message that is sent.
+`fallback`, `dedup_key`, `locale` — is accepted by `enqueue` and handed over
+unchanged when the ticket is drained, so routing, quiet hours, retries, fallback
+and deduplication behave exactly as they do on a direct send. The context is
+copied into the ticket, so a dict the caller goes on mutating cannot change the
+message that is sent.
 
 A drain settles every ticket it handles, and a ticket is the place to look:
 
