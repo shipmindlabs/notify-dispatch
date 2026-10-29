@@ -208,6 +208,29 @@ against the dispatcher's clock — pass `now=` for a fixed moment, or
 `Dispatcher(..., clock=...)` to control it everywhere. A window whose start is
 later than its end (22:00–07:00) wraps past midnight.
 
+A window can name the clock it belongs to. With a `tz` the moment is converted
+into that zone before the clock is read, so a recipient's night is their own:
+
+```python
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
+
+kenji = Recipient(
+    phone="+81...",
+    quiet_hours=QuietHours(time(22, 0), time(7, 0), tz=ZoneInfo("Asia/Tokyo")),
+)
+
+dispatcher.send(
+    kenji, confirmation, context, now=datetime(2026, 3, 1, 23, 0, tzinfo=timezone.utc)
+)
+# sent: 23:00 UTC is 08:00 in Tokyo, where the night is already over
+```
+
+A zoned window needs a moment that names its own zone and refuses a naive one
+instead of guessing which clock it was written on, and `QuietHoursError.until`
+carries the same zone as the window. Without a `tz` nothing changes: the moment
+is read exactly as it arrives.
+
 ## Attempts, retries and dead letters
 
 A delivery is attempted once by default. Pass a `RetryPolicy` to try again with

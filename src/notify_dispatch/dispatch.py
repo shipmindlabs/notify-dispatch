@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, time
+from datetime import datetime, time, tzinfo
 from enum import Enum
 from time import sleep as _sleep
 from typing import Protocol
@@ -78,7 +78,11 @@ class UnroutableError(DispatchError):
 
 
 class QuietHoursError(DispatchError):
-    """Every usable channel is inside the recipient's do-not-disturb window."""
+    """Every usable channel is inside the recipient's do-not-disturb window.
+
+    ``until`` is the end of the window on the clock the window is read on, and
+    carries that zone when the window has one.
+    """
 
     def __init__(self, template: str, silenced: Iterable[Channel], until: time) -> None:
         self.template = template
@@ -130,12 +134,16 @@ class DuplicateSendError(DispatchError):
 class QuietHours:
     """A wall-clock window during which some channels stay silent.
 
-    A window whose start is later than its end wraps past midnight.
+    A window whose start is later than its end wraps past midnight. With a
+    ``tz`` the window is read on that clock: a moment is converted into it
+    before the clock is read, and a moment that names no zone is refused
+    rather than guessed at.
     """
 
     start: time
     end: time
     channels: tuple[Channel, ...] = tuple(Channel)
+    tz: tzinfo | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "channels", tuple(self.channels))
@@ -144,15 +152,32 @@ class QuietHours:
         if not self.channels:
             raise ValueError("quiet hours must silence at least one channel")
 
+    @property
+    def until(self) -> time:
+        """The end of the window, carrying the zone it is read on."""
+        if self.tz is None:
+            return self.end
+        return self.end.replace(tzinfo=self.tz)
+
     def covers(self, moment: datetime | time) -> bool:
         """Return whether a moment falls inside the window."""
-        at = moment.time() if isinstance(moment, datetime) else moment
+        at = self._reading(moment)
         if self.start < self.end:
             return self.start <= at < self.end
         return at >= self.start or at < self.end
 
     def silences(self, channel: Channel, moment: datetime | time) -> bool:
         return channel in self.channels and self.covers(moment)
+
+    def _reading(self, moment: datetime | time) -> time:
+        if self.tz is None:
+            return moment.time() if isinstance(moment, datetime) else moment
+        if not isinstance(moment, datetime) or moment.tzinfo is None:
+            raise ValueError(
+                "quiet hours with a tz can only read an aware datetime, "
+                f"got {moment!r}"
+            )
+        return moment.astimezone(self.tz).time()
 
 
 @dataclass(frozen=True)
@@ -433,7 +458,7 @@ class Dispatcher:
             return self._deliver(routes, retry or self._retry)
         if silenced:
             assert recipient.quiet_hours is not None
-            raise QuietHoursError(variant.name, silenced, recipient.quiet_hours.end)
+            raise QuietHoursError(variant.name, silenced, recipient.quiet_hours.until)
         raise UnroutableError(variant.name, candidates)
 
     def _localize(
