@@ -6,8 +6,9 @@ the same protocol, so swapping a provider does not touch any call site. A
 handover that fails can be retried, a channel that has used up its attempts can
 fall back to the next one the recipient is reachable on, a delivery that never
 succeeds is kept as a dead letter instead of disappearing, an event that arrives
-twice under the same dedup key is delivered once, and a recipient with a locale
-gets the variant of the template written in their language.
+twice under the same dedup key is delivered once, an address that asked not to
+be notified is skipped before a provider ever sees it, and a recipient with a
+locale gets the variant of the template written in their language.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from typing import Protocol
 from notify_dispatch.dedup import DedupStore
 from notify_dispatch.delivery import NO_RETRY, Attempt, DeadLetterQueue, RetryPolicy
 from notify_dispatch.locales import LocalizedTemplate, normalize_locale
+from notify_dispatch.suppress import Suppression, SuppressionList
 from notify_dispatch.templates import Template
 
 __all__ = [
@@ -40,6 +42,7 @@ __all__ = [
     "Receipt",
     "Recipient",
     "SmsAdapter",
+    "SuppressedError",
     "UnroutableError",
     "Urgency",
 ]
@@ -75,6 +78,25 @@ class UnroutableError(DispatchError):
         self.tried = tuple(tried)
         listed = ", ".join(channel.value for channel in self.tried) or "nothing"
         super().__init__(f"template {template!r} has no usable channel; tried {listed}")
+
+
+class SuppressedError(DispatchError):
+    """Every usable channel is refused by the suppression list.
+
+    ``refused`` maps each channel to the entry that refused it, and
+    ``suppressed`` names those channels in the order they were tried.
+    """
+
+    def __init__(self, template: str, refused: Mapping[Channel, Suppression]) -> None:
+        self.template = template
+        self.refused = dict(refused)
+        self.suppressed = tuple(self.refused)
+        listed = ", ".join(channel.value for channel in self.suppressed)
+        reasons = sorted(
+            {entry.reason for entry in self.refused.values() if entry.reason}
+        )
+        detail = f" ({'; '.join(reasons)})" if reasons else ""
+        super().__init__(f"template {template!r} is suppressed on {listed}{detail}")
 
 
 class QuietHoursError(DispatchError):
@@ -307,6 +329,7 @@ class Dispatcher:
         fallback: bool = False,
         dead_letters: DeadLetterQueue | None = None,
         dedup: DedupStore | None = None,
+        suppressions: SuppressionList | None = None,
         sleep: Callable[[float], None] = _sleep,
     ) -> None:
         self._adapters: dict[Channel, ChannelAdapter] = {}
@@ -318,6 +341,9 @@ class Dispatcher:
             dead_letters if dead_letters is not None else DeadLetterQueue()
         )
         self._dedup = dedup if dedup is not None else DedupStore()
+        self._suppressions = (
+            suppressions if suppressions is not None else SuppressionList()
+        )
         self._sleep = sleep
         for adapter in adapters:
             self.register(adapter)
@@ -339,6 +365,11 @@ class Dispatcher:
     def dedup(self) -> DedupStore:
         """The keys that were already delivered."""
         return self._dedup
+
+    @property
+    def suppressions(self) -> SuppressionList:
+        """The addresses that may not be handed to a provider."""
+        return self._suppressions
 
     @property
     def retry_policy(self) -> RetryPolicy:
@@ -372,7 +403,8 @@ class Dispatcher:
         accepted the message: a redelivery of the same event gets the first
         receipt back instead of being sent again, while a send that failed
         leaves the key free. A ``locale`` overrides the recipient's own and is
-        only consulted for a ``LocalizedTemplate``.
+        only consulted for a ``LocalizedTemplate``. An address on the
+        suppression list is skipped even for an urgent send.
         """
         moment = now if now is not None else self._clock()
         if dedup_key is None:
@@ -433,11 +465,16 @@ class Dispatcher:
         candidates = (channel,) if channel is not None else self._preference(recipient)
         may_fall_back = fallback if fallback is not None else self._fallback
         routes: list[tuple[ChannelAdapter, Message]] = []
+        refused: dict[Channel, Suppression] = {}
         silenced: list[Channel] = []
         for candidate in candidates:
             address = recipient.address_for(candidate)
             adapter = self._adapters.get(candidate)
             if address is None or adapter is None:
+                continue
+            entry = self._suppressions.suppression_for(address, candidate)
+            if entry is not None:
+                refused[candidate] = entry
                 continue
             if urgency is not Urgency.URGENT and recipient.is_quiet(candidate, moment):
                 silenced.append(candidate)
@@ -456,6 +493,9 @@ class Dispatcher:
                 break
         if routes:
             return self._deliver(routes, retry or self._retry)
+        # a quiet window reopens in the morning, an opt-out does not
+        if refused:
+            raise SuppressedError(variant.name, refused)
         if silenced:
             assert recipient.quiet_hours is not None
             raise QuietHoursError(variant.name, silenced, recipient.quiet_hours.until)

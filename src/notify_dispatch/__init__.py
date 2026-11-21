@@ -24,6 +24,7 @@ from notify_dispatch.dispatch import (
     Receipt,
     Recipient,
     SmsAdapter,
+    SuppressedError,
     UnroutableError,
     Urgency,
 )
@@ -43,6 +44,7 @@ from notify_dispatch.outbox import (
     TicketState,
     Worker,
 )
+from notify_dispatch.suppress import Suppression, SuppressionList
 from notify_dispatch.templates import (
     MissingVariableError,
     Template,
@@ -86,6 +88,9 @@ __all__ = [
     "Recipient",
     "RetryPolicy",
     "SmsAdapter",
+    "SuppressedError",
+    "Suppression",
+    "SuppressionList",
     "Template",
     "TemplateDefinitionError",
     "TemplateError",
