@@ -10,6 +10,8 @@ from notify_dispatch.delivery import (
 )
 from notify_dispatch.dispatch import (
     DEFAULT_CHANNEL_ORDER,
+    Batch,
+    BatchResult,
     Channel,
     ChannelAdapter,
     DeliveryError,
@@ -62,6 +64,8 @@ __all__ = [
     "DEFAULT_DEDUP_TTL",
     "NO_RETRY",
     "Attempt",
+    "Batch",
+    "BatchResult",
     "Channel",
     "ChannelAdapter",
     "DeadLetter",

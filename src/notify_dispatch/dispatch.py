@@ -8,12 +8,14 @@ fall back to the next one the recipient is reachable on, a delivery that never
 succeeds is kept as a dead letter instead of disappearing, an event that arrives
 twice under the same dedup key is delivered once, an address that asked not to
 be notified is skipped before a provider ever sees it, and a recipient with a
-locale gets the variant of the template written in their language.
+locale gets the variant of the template written in their language. One call also
+carries a notification to a whole audience, with a result for every recipient
+rather than an exception for the first one nobody can reach.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, time, tzinfo
 from enum import Enum
@@ -28,6 +30,8 @@ from notify_dispatch.templates import Template
 
 __all__ = [
     "DEFAULT_CHANNEL_ORDER",
+    "Batch",
+    "BatchResult",
     "Channel",
     "ChannelAdapter",
     "DeliveryError",
@@ -273,6 +277,73 @@ class Receipt:
         return self.message.channel
 
 
+@dataclass(frozen=True)
+class BatchResult:
+    """What one recipient of a batch produced: a receipt or the error it raised."""
+
+    recipient: Recipient
+    receipt: Receipt | None = None
+    error: DispatchError | None = None
+
+    @property
+    def is_sent(self) -> bool:
+        return self.receipt is not None
+
+    @property
+    def is_failed(self) -> bool:
+        return self.error is not None
+
+
+@dataclass(frozen=True)
+class Batch:
+    """One notification sent to several recipients, one result each, in order.
+
+    A recipient who could not be reached is a result in the batch rather than
+    an exception, so one unroutable address does not keep the rest of an
+    audience from being notified.
+    """
+
+    template: str
+    results: tuple[BatchResult, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "results", tuple(self.results))
+
+    @property
+    def receipts(self) -> tuple[Receipt, ...]:
+        return tuple(
+            result.receipt for result in self.results if result.receipt is not None
+        )
+
+    @property
+    def failures(self) -> tuple[BatchResult, ...]:
+        return tuple(result for result in self.results if result.is_failed)
+
+    @property
+    def sent(self) -> int:
+        return len(self.receipts)
+
+    @property
+    def failed(self) -> int:
+        return len(self.failures)
+
+    @property
+    def all_sent(self) -> bool:
+        return not self.failures
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __iter__(self) -> Iterator[BatchResult]:
+        return iter(self.results)
+
+    def __str__(self) -> str:
+        return (
+            f"{self.template!r} sent to {self.sent} of "
+            f"{len(self.results)} recipient(s)"
+        )
+
+
 class ChannelAdapter(Protocol):
     """The single interface every provider integration implements."""
 
@@ -443,6 +514,59 @@ class Dispatcher:
             raise
         self._dedup.complete(dedup_key, receipt, at=moment)
         return receipt
+
+    def send_many(
+        self,
+        recipients: Iterable[Recipient],
+        template: Template | LocalizedTemplate,
+        context: Mapping[str, object] | None = None,
+        *,
+        channel: Channel | None = None,
+        subject: str | None = None,
+        urgency: Urgency = Urgency.NORMAL,
+        now: datetime | None = None,
+        retry: RetryPolicy | None = None,
+        fallback: bool | None = None,
+        dedup_key: Callable[[Recipient], str] | None = None,
+        locale: str | None = None,
+    ) -> Batch:
+        """Send one notification to several recipients and report each outcome.
+
+        Every recipient is routed, localized and retried exactly as it would be
+        on its own, against a single reading of the clock, so a quiet-hours
+        window cannot close between the first recipient and the last. A
+        ``DispatchError`` settles its own recipient and the batch carries on; a
+        template error is the same for everybody and is raised instead, before
+        any provider is reached. A ``dedup_key`` is a function of the recipient,
+        because one key names one notification.
+        """
+        if dedup_key is not None and not callable(dedup_key):
+            raise TypeError(
+                "a batch dedup key must be a function of the recipient, so that "
+                "two recipients of one event do not share a key"
+            )
+        moment = now if now is not None else self._clock()
+        results: list[BatchResult] = []
+        for recipient in recipients:
+            try:
+                receipt = self.send(
+                    recipient,
+                    template,
+                    context,
+                    channel=channel,
+                    subject=subject,
+                    urgency=urgency,
+                    now=moment,
+                    retry=retry,
+                    fallback=fallback,
+                    dedup_key=dedup_key(recipient) if dedup_key is not None else None,
+                    locale=locale,
+                )
+            except DispatchError as exc:
+                results.append(BatchResult(recipient=recipient, error=exc))
+            else:
+                results.append(BatchResult(recipient=recipient, receipt=receipt))
+        return Batch(template=template.name, results=tuple(results))
 
     def _send(
         self,
